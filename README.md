@@ -50,4 +50,3 @@ A lightweight, smooth and blazing-fast batch file renaming utility for inspired 
 
 ---
 
-## 💻 How to Build & Run
