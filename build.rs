@@ -6,6 +6,8 @@ fn main() {
         res.set_icon("assets/RenameAll.ico");
         res.set("FileDescription", "Bulk Renamer");
         res.set("ProductName", "RenameAll");
+        res.set("FileVersion", env!("CARGO_PKG_VERSION"));
+        res.set("ProductVersion", env!("CARGO_PKG_VERSION"));
         res.set("OriginalFilename", "RenameAll.exe");
         res.set("InternalName", "RenameAll");
         if let Err(e) = res.compile() {
