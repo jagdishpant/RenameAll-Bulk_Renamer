@@ -1,15 +1,77 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod engine;
 mod ui;
+pub mod installer;
+pub mod single_instance;
 
 use std::path::PathBuf;
 use ui::RenameAllApp;
 
 fn main() -> eframe::Result<()> {
-    // Parse arguments: allow passing files or folders directly on launch
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let initial_paths: Vec<PathBuf> = args.into_iter().map(PathBuf::from).collect();
+
+    // Check for CLI installation flags
+    if args.iter().any(|a| a == "--install" || a == "-i" || a == "/install") {
+        match installer::install_to_default_location(true, true, true) {
+            Ok(path) => {
+                println!("Successfully installed RenameAll to: {}", path.display());
+                let _ = std::process::Command::new("powershell")
+                    .args([
+                        "-NoProfile",
+                        "-Command",
+                        &format!(
+                            "[System.Windows.Forms.MessageBox]::Show('RenameAll was successfully installed to:\\n{}\\n\\nDesktop shortcut, Start Menu entry, and Windows Explorer context menu have been registered.', 'RenameAll Setup', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)",
+                            path.display().to_string().replace('\\', "\\\\")
+                        ),
+                    ])
+                    .output();
+            }
+            Err(e) => {
+                eprintln!("Installation error: {}", e);
+                let _ = std::process::Command::new("powershell")
+                    .args([
+                        "-NoProfile",
+                        "-Command",
+                        &format!(
+                            "[System.Windows.Forms.MessageBox]::Show('Installation failed: {}', 'RenameAll Setup Error', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)",
+                            e.replace('\'', "''")
+                        ),
+                    ])
+                    .output();
+            }
+        }
+        return Ok(());
+    }
+
+    if args.iter().any(|a| a == "--uninstall" || a == "-u" || a == "/uninstall") {
+        installer::uninstall();
+        let _ = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "[System.Windows.Forms.MessageBox]::Show('RenameAll shortcuts and context menu entries have been removed.', 'RenameAll Uninstalled', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)",
+            ])
+            .output();
+        return Ok(());
+    }
+
+    // Filter out flags, remaining are file/folder paths
+    let initial_paths: Vec<PathBuf> = args
+        .into_iter()
+        .filter(|a| !a.starts_with('-') && !a.starts_with('/'))
+        .map(PathBuf::from)
+        .collect();
+
+    // Single-instance coordination:
+    // If an instance is already running (e.g. from Explorer multi-file select),
+    // send files to the primary instance over a named pipe and exit immediately.
+    let ipc_receiver = match single_instance::check_single_instance(&initial_paths) {
+        single_instance::InstanceRole::Secondary => {
+            return Ok(());
+        }
+        single_instance::InstanceRole::Primary(rx) => rx,
+    };
 
     // Load RenameAll icon for window title bar and taskbar
     let icon_data = {
@@ -28,8 +90,10 @@ fn main() -> eframe::Result<()> {
     };
 
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title("RenameAll - Bulk Renamer")
-        .with_inner_size([1060.0, 690.0])
+        .with_title(&format!("RenameAll v{} - Bulk Renamer", env!("CARGO_PKG_VERSION")))
+        .with_inner_size([1160.0, 700.0])
+        // Start at the upper-left corner of the primary monitor.
+        .with_position([0.0, 0.0])
         .with_min_inner_size([760.0, 500.0])
         .with_drag_and_drop(true);
 
@@ -45,6 +109,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "RenameAll",
         native_options,
-        Box::new(|_cc| Ok(Box::new(RenameAllApp::new(initial_paths)))),
+        Box::new(|_cc| Ok(Box::new(RenameAllApp::new(initial_paths, Some(ipc_receiver))))),
     )
 }
