@@ -39,6 +39,7 @@ pub struct FileItem {
     pub original_name: String,
     pub new_name: String,
     pub is_directory: bool,
+    pub is_subfolder: bool,
     pub selected: bool,
     pub status: ItemStatus,
 }
@@ -263,6 +264,36 @@ pub fn compute_name(
     Ok(final_name)
 }
 
+/// A case-only rename is not a collision with itself. Inspect directory entries
+/// using their actual names instead of canonicalized paths: on Windows,
+/// canonicalize() may preserve the requested spelling and cannot reliably
+/// distinguish the source from its differently-cased destination.
+///
+/// Refuse the rename if a *different* sibling has the desired name, including
+/// case-sensitive Windows directories that can contain case variants.
+fn case_only_target_is_self(item: &FileItem) -> std::io::Result<bool> {
+    if item.original_name == item.new_name
+        || item.original_name.to_lowercase() != item.new_name.to_lowercase()
+    {
+        return Ok(false);
+    }
+
+    let mut source_found = false;
+    for entry in fs::read_dir(&item.directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == item.original_name {
+            source_found = true;
+        } else if name.to_lowercase() == item.new_name.to_lowercase() {
+            // A second, separately named directory entry would be overwritten
+            // on case-sensitive directories, so never treat it as self.
+            return Ok(false);
+        }
+    }
+    Ok(source_found)
+}
+
 /// Updates previews and recalculates collisions & statuses for all loaded items
 pub fn update_preview_list(items: &mut [FileItem], config: &RenameConfig) -> Result<(), String> {
     // Compile regex if enabled
@@ -335,19 +366,24 @@ pub fn update_preview_list(items: &mut [FileItem], config: &RenameConfig) -> Res
                 ));
             }
         } else if let Some(&idx) = indices.first() {
-            // Check if destination exists on disk and is NOT one of the renaming items
+            // Treat a capitalization-only change as a rename of this same
+            // directory entry, not a collision with its own Windows alias.
+            // Inspect the *actual* directory entries rather than canonicalizing
+            // two differently spelled paths. The latter gave false conflicts.
             let dest_path = dir.join(&items[idx].new_name);
-            if dest_path.exists() {
-                // If it exists, check whether it is the same file (e.g. only case change on Windows)
-                // or if it belongs to another selected file in our list
-                let is_self = dest_path == items[idx].original_path;
-                let is_other_in_batch = items.iter().any(|other| other.original_path == dest_path);
-
-                if !is_self && !is_other_in_batch {
-                    items[idx].status = ItemStatus::Conflict(
-                        "A file or folder with this name already exists on disk".to_string(),
-                    );
-                }
+            let is_self = case_only_target_is_self(&items[idx]).unwrap_or(false);
+            if !is_self && dest_path.exists() {
+                items[idx].status = ItemStatus::Conflict(
+                    "A file or folder with this name already exists on disk".to_string(),
+                );
+            } else if !is_self && items[idx].original_name.to_lowercase()
+                == items[idx].new_name.to_lowercase()
+            {
+                // A distinct case-variant may exist on a case-sensitive
+                // directory even if `dest_path.exists()` is false.
+                items[idx].status = ItemStatus::Conflict(
+                    "Cannot safely identify the original file or folder for this case-only rename".to_string(),
+                );
             }
         }
     }
@@ -481,4 +517,106 @@ pub fn execute_undo(undo_history: Vec<UndoEntry>) -> (usize, Vec<String>) {
     }
 
     (reverted_count, errors)
+}
+
+
+#[cfg(test)]
+mod case_only_regression_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_dir() -> PathBuf {
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("renameall_case_{}_{}", std::process::id(), stamp));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn item(dir: &std::path::Path, name: &str) -> FileItem {
+        FileItem {
+            id: 0,
+            original_path: dir.join(name),
+            directory: dir.to_path_buf(),
+            original_name: name.to_owned(),
+            new_name: String::new(),
+            is_directory: false,
+            is_subfolder: false,
+            selected: true,
+            status: ItemStatus::Unchanged,
+        }
+    }
+
+    #[test]
+    fn different_existing_file_remains_conflict() {
+        let dir = test_dir();
+        fs::write(dir.join("one.txt"), b"one").unwrap();
+        fs::write(dir.join("two.txt"), b"two").unwrap();
+        let mut items = vec![item(&dir, "one.txt")];
+        let mut config = RenameConfig::default();
+        config.search = "one".into();
+        config.replace = "two".into();
+        update_preview_list(&mut items, &config).unwrap();
+        assert!(matches!(items[0].status, ItemStatus::Conflict(_)));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn uppercase_case_preview_is_ready() {
+        let dir = test_dir();
+        fs::write(dir.join("report.txt"), b"example").unwrap();
+        let mut items = vec![item(&dir, "report.txt")];
+        let mut config = RenameConfig::default();
+        config.format = TextFormat::Uppercase;
+        update_preview_list(&mut items, &config).unwrap();
+        assert_eq!(items[0].new_name, "REPORT.txt");
+        assert!(matches!(items[0].status, ItemStatus::Ready), "{:?}", items[0].status);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn lowercase_case_preview_is_ready() {
+        let dir = test_dir();
+        fs::write(dir.join("REPORT.txt"), b"example").unwrap();
+        let mut items = vec![item(&dir, "REPORT.txt")];
+        let mut config = RenameConfig::default();
+        config.format = TextFormat::Lowercase;
+        update_preview_list(&mut items, &config).unwrap();
+        assert_eq!(items[0].new_name, "report.txt");
+        assert!(matches!(items[0].status, ItemStatus::Ready), "{:?}", items[0].status);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn folder_case_preview_is_ready() {
+        let dir = test_dir();
+        fs::create_dir(dir.join("My Folder")).unwrap();
+        let mut folder = item(&dir, "My Folder");
+        folder.is_directory = true;
+        let mut items = vec![folder];
+        let mut config = RenameConfig::default();
+        config.format = TextFormat::Lowercase;
+        update_preview_list(&mut items, &config).unwrap();
+        assert_eq!(items[0].new_name, "my folder");
+        assert!(matches!(items[0].status, ItemStatus::Ready), "{:?}", items[0].status);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn uppercase_only_rename_is_allowed_and_executed() {
+        let dir = test_dir();
+        fs::write(dir.join("report.txt"), b"example").unwrap();
+        let mut items = vec![item(&dir, "report.txt")];
+        let mut config = RenameConfig::default();
+        config.scope = super::super::rules::TargetScope::FilenameAndExtension;
+        config.format = TextFormat::Uppercase;
+        update_preview_list(&mut items, &config).unwrap();
+        assert_eq!(items[0].new_name, "REPORT.TXT");
+        assert!(matches!(items[0].status, ItemStatus::Ready));
+        let (_undo, errors) = execute_batch_rename(&mut items);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(items[0].original_name, "REPORT.TXT");
+        assert!(dir.join("REPORT.TXT").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
 }
