@@ -105,8 +105,8 @@ impl Default for RenameConfig {
             format: TextFormat::None,
             enumerate: EnumerateConfig::default(),
             include_files: true,
-            include_folders: true,
-            include_subfolders: false,
+            include_folders: false,
+            include_subfolders: true,
         }
     }
 }
